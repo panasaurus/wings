@@ -67,7 +67,7 @@ pub fn router(state: Arc<State>) -> Result<Router> {
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
     let protected = Router::new()
         .route("/api/system", get(system))
-        .route("/api/update", post(unsupported))
+        .route("/api/update", post(update_config))
         .route("/api/servers", get(servers).post(create))
         .route("/api/servers/{id}", get(details).delete(delete))
         .route("/api/servers/{id}/logs", get(logs))
@@ -123,6 +123,69 @@ async fn unsupported() -> ApiError {
     )
 }
 
+#[derive(Deserialize)]
+struct ConfigUpdate {
+    #[serde(default)]
+    token_id: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    remote: Option<String>,
+    #[serde(default)]
+    jwt_audience: Option<String>,
+    #[serde(default)]
+    allowed_origins: Option<Vec<String>>,
+}
+
+async fn update_config(
+    AppState(state): AppState<Arc<State>>,
+    Json(body): Json<ConfigUpdate>,
+) -> ApiResult<StatusCode> {
+    let mut config = state.config.write().await;
+    if let Some(token_id) = body.token_id {
+        if !token_id.trim().is_empty() {
+            config.token_id = token_id;
+        }
+    }
+    if let Some(token) = body.token {
+        if token.len() >= 32 {
+            config.token = token;
+        }
+    }
+    if let Some(remote) = body.remote {
+        if reqwest::Url::parse(&remote).is_ok() {
+            config.remote = remote;
+        }
+    }
+    if let Some(jwt_audience) = body.jwt_audience {
+        if !jwt_audience.trim().is_empty() {
+            config.jwt_audience = jwt_audience;
+        }
+    }
+    if let Some(allowed_origins) = body.allowed_origins {
+        config.allowed_origins = allowed_origins;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn disk_space(path: &std::path::Path) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) {
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } == 0 {
+                let total = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
+                let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+                return (total, free);
+            }
+        }
+    }
+    let _ = path;
+    (0, 0)
+}
+
 async fn system(
     AppState(state): AppState<Arc<State>>,
     Query(query): Query<HashMap<String, String>>,
@@ -139,18 +202,19 @@ async fn system(
         .as_str()
         .unwrap_or(std::env::consts::ARCH);
     let kernel = info["KernelVersion"].as_str().unwrap_or("unknown");
+    let (disk_total, disk_free) = disk_space(&state.engine.config.system.data);
     if query.get("v").is_some_and(|v| v == "2") {
         Ok(Json(
             json!({"version":env!("CARGO_PKG_VERSION"),"implementation":"panasaurus-wings-rust",
             "docker":{"version":version["Version"],"cgroups":{"driver":info["CgroupDriver"],"version":info["CgroupVersion"]},
                 "containers":{"total":info["Containers"],"running":info["ContainersRunning"],"paused":info["ContainersPaused"],"stopped":info["ContainersStopped"]},
                 "storage":{"driver":info["Driver"],"filesystem":""},"runc":{"version":info["RuncCommit"]["ID"]}},
-            "system":{"architecture":architecture,"cpu_threads":info["NCPU"],"memory_bytes":info["MemTotal"],"kernel_version":kernel,"os":info["OperatingSystem"],"os_type":info["OSType"]}}),
+            "system":{"architecture":architecture,"cpu_threads":info["NCPU"],"memory_bytes":info["MemTotal"],"kernel_version":kernel,"os":info["OperatingSystem"],"os_type":info["OSType"],"disk_bytes":{"total":disk_total,"free":disk_free}}}),
         ))
     } else {
         Ok(Json(
             json!({"architecture":architecture,"cpu_count":info["NCPU"],"kernel_version":kernel,"os":info["OSType"],
-            "version":env!("CARGO_PKG_VERSION"),"implementation":"panasaurus-wings-rust"}),
+            "version":env!("CARGO_PKG_VERSION"),"implementation":"panasaurus-wings-rust","disk_bytes":{"total":disk_total,"free":disk_free}}),
         ))
     }
 }
@@ -602,6 +666,18 @@ fn normalize_install_script(script: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calculates_system_disk_space() {
+        let root = tempfile::tempdir().unwrap();
+        let (total, free) = disk_space(root.path());
+        if cfg!(unix) {
+            assert!(total > 0);
+            assert!(free > 0);
+        } else {
+            assert_eq!((total, free), (0, 0));
+        }
+    }
 
     #[test]
     fn normalizes_windows_installers_without_altering_other_carriage_returns() {
