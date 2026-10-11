@@ -12,7 +12,7 @@ No Sponsors yet
 
 * [Panel Documentation](https://panasaurus.github.io)
 * [Wings Documentation](https://panasaurus.github.io)
-* Or, get additional help [via Discord]([https://discord.gg/pterodactyl](https://discord.gg/tszvW9zKN7))
+* Or, get additional help [via Discord](https://discord.gg/tszvW9zKN7)
 
 ## Reporting Issues
 
