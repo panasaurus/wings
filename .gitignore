@@ -1,0 +1,9 @@
+/target/
+/config.yml
+/data/
+/.local/
+.env
+.env.*
+.DS_Store
+__pycache__/
+*.py[cod]

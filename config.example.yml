@@ -1,0 +1,20 @@
+uuid: REPLACE_WITH_NODE_UUID
+token_id: REPLACE_WITH_NODE_TOKEN_ID
+token: REPLACE_WITH_NODE_TOKEN
+remote: http://localhost:8080
+jwt_audience: http://127.0.0.1:8081
+api:
+  host: 127.0.0.1
+  port: 8081
+  ssl:
+    enabled: false
+system:
+  data: /var/lib/panasaurus/volumes
+  default_disk_limit_mb: 20480
+docker:
+  executable: docker
+  user: "1000:1000"
+allowed_origins:
+  - http://localhost:8080
+
+hibernation: []

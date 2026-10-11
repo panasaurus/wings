@@ -1,0 +1,10 @@
+hibernation:
+  - server: REPLACE_WITH_MINECRAFT_SERVER_UUID
+    egg: REPLACE_WITH_MINECRAFT_JAVA_EGG_UUID
+    listen: 127.0.0.1:25565
+    idle_timeout_seconds: 600
+    startup_grace_seconds: 120
+    poll_interval_seconds: 15
+    startup_timeout_seconds: 120
+    stop_timeout_seconds: 120
+    connection_limit: 128
