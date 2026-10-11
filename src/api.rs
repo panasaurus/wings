@@ -119,7 +119,7 @@ async fn authorize(
 async fn unsupported() -> ApiError {
     ApiError(
         StatusCode::NOT_IMPLEMENTED,
-        "This operation is not implemented in the Rust prototype.".into(),
+        "This operation is not implemented.".into(),
     )
 }
 
@@ -336,6 +336,7 @@ async fn install(state: &State, id: &str) -> Result<()> {
         ]);
         if let Some(env) = settings["environment"].as_object() {
             for (key, value) in env {
+                ensure!(!key.contains(['=', '\0']) && !key.starts_with('-'), "Invalid environment key");
                 args.extend(strings(&[
                     "--env",
                     &format!(
