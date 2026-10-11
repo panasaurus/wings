@@ -100,6 +100,12 @@ impl Config {
         );
         reqwest::Url::parse(&config.remote).context("Invalid panel URL")?;
         ensure!(
+            !config.docker.user.trim().is_empty()
+                && !config.docker.user.starts_with('-')
+                && config.docker.user.chars().all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-'),
+            "docker.user must be a valid user/group specification (e.g., '1000:1000')"
+        );
+        ensure!(
             config.docker.command_timeout_seconds > 0,
             "Docker command timeout must be positive"
         );
@@ -137,5 +143,25 @@ mod tests {
         config["system"]["default_disk_limit_mb"] = serde_json::json!(0);
         std::fs::write(&path, config.to_string()).unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn validates_docker_user_format() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.yml");
+        let mut config = serde_json::json!({
+            "uuid":uuid::Uuid::new_v4().to_string(), "token_id":"fixture", "token":"a".repeat(64),
+            "remote":"http://127.0.0.1:8080", "jwt_audience":"http://127.0.0.1:8081",
+            "api":{"host":"127.0.0.1","port":8081}, "system":{"data":root.path()},
+            "docker":{"user":"1000:1000"}
+        });
+        std::fs::write(&path, config.to_string()).unwrap();
+        assert!(Config::load(&path).is_ok());
+
+        for invalid_user in ["", "  ", "-1000:1000", "--user", "1000; rm -rf /"] {
+            config["docker"]["user"] = serde_json::json!(invalid_user);
+            std::fs::write(&path, config.to_string()).unwrap();
+            assert!(Config::load(&path).is_err(), "Accepted invalid docker.user: {invalid_user}");
+        }
     }
 }

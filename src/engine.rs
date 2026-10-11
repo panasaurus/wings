@@ -207,7 +207,7 @@ impl Engine {
         }
         ensure!(
             settings["mounts"].as_array().is_none_or(Vec::is_empty),
-            "Additional host mounts are not supported in this prototype"
+            "Additional host mounts are not supported"
         );
         args.push(image.to_owned());
         self.run(&args).await?;
