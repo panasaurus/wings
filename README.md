@@ -10,8 +10,8 @@ No Sponsors yet
 
 ## Documentation
 
-* [Panel Documentation](https://panasaurus.github.io)
-* [Wings Documentation](https://panasaurus.github.io)
+* [Panel Documentation](https://panasaurus.com)
+* [Wings Documentation](https://panasaurus.com)
 * Or, get additional help [via Discord](https://discord.gg/tszvW9zKN7)
 
 ## Reporting Issues
