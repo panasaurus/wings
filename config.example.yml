@@ -6,15 +6,49 @@ jwt_audience: http://127.0.0.1:8081
 api:
   host: 127.0.0.1
   port: 8081
+  upload_limit: 100
   ssl:
     enabled: false
 system:
   data: /var/lib/panasaurus/volumes
   default_disk_limit_mb: 20480
+  sftp:
+    enabled: true
+    bind_address: 127.0.0.1
+    bind_port: 2022
+    max_handles: 64
 docker:
   executable: docker
   user: "1000:1000"
+  tmpfs_size: 64
+  container_pid_limit: 512
+  cpu_period: 100000
+  cpu_shares: 0
+  memory_overhead_percent: 0
+  installer_limits:
+    memory: 1024
+    cpu: 100
+    timeout_seconds: 3600
+  registries: {}
+  network:
+    name: null
+    dns: []
+    enable_icc: false
 allowed_origins:
   - http://localhost:8080
 
 hibernation: []
+
+allowed_mounts: []
+downloads:
+  allowed_hosts: []
+limits:
+  jobs: 8
+  sftp_connections: 64
+  transfer_bytes: 68719476736
+recovery:
+  enabled: true
+  restart_crashed: true
+  detect_clean_exit: false
+  crash_cooldown_seconds: 60
+  stop_timeout_seconds: 120

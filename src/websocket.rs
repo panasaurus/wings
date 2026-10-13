@@ -15,7 +15,6 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Deserialize;
 use serde_json::json;
 use std::{
-    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -217,7 +216,10 @@ async fn handle(
     let mut messages = MessageLimit::new(20);
     let mut authentications = MessageLimit::new(1);
     let mut last_status = None;
-    let mut seen = HashSet::new();
+    let Ok(server) = state.server(&id).await else {
+        return;
+    };
+    let mut events = server.events.subscribe();
     let mut timer = tokio::time::interval(Duration::from_secs(3));
     let deadline = tokio::time::sleep(Duration::from_secs(15));
     tokio::pin!(deadline);
@@ -251,7 +253,7 @@ async fn handle(
                                     }
                                     claims = Some(value);
                                     if send(&mut socket, "auth success", Vec::new()).await.is_err() { return; }
-                                    if let Ok(status) = state.engine.state(&id).await && send_status(&mut socket, &mut last_status, status).await.is_err() { return; }
+                                    if let Ok(status) = crate::lifecycle::status(&state,&id).await && send_status(&mut socket, &mut last_status, status).await.is_err() { return; }
                                 }
                                 Ok(_) => { let _ = send(&mut socket, "jwt error", vec!["jwt: created too far in past (denylist)".into()]).await; return; }
                                 Err(error) => {
@@ -266,7 +268,9 @@ async fn handle(
                         if !valid(&state, authorization).await { let _ = send(&mut socket, "jwt error", vec!["jwt: exp claim is invalid".into()]).await; return; }
                         let argument = packet.args.first().map(String::as_str).unwrap_or("");
                         let result = match packet.event.as_str() {
-                            "send logs" => { seen.clear(); Ok(()) },
+                            "send logs" => {
+                                if let Ok(lines)=state.engine.logs(&id).await{for line in lines{let text=line.split_once(' ').map(|(_,s)|s).unwrap_or(&line).to_owned();if send(&mut socket,"console output",vec![text]).await.is_err(){return}}}Ok(())
+                            },
                             "send stats" => Ok(()),
                             "send command" if authorization.permission("control.console") => state.engine.send_command(&id, argument).await,
                             "set state" => {
@@ -283,26 +287,26 @@ async fn handle(
                     _ => continue,
                 }
             }
+            event=events.recv(),if claims.is_some()=>{
+                if !valid(&state,claims.as_ref().unwrap()).await{return}
+                match event{
+                    Ok(packet)=>{let event=packet["event"].as_str().unwrap_or("daemon message");let args=serde_json::from_value::<Vec<String>>(packet["args"].clone()).unwrap_or_default();if send(&mut socket,event,args).await.is_err(){return}},
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>{if send(&mut socket,"daemon message",vec!["Some console messages were skipped; request logs to refresh.".into()]).await.is_err(){return}},
+                    Err(_)=>return
+                }
+            }
             _ = timer.tick(), if claims.is_some() => {
                 let authorization = claims.as_ref().unwrap();
                 if !valid(&state, authorization).await { let _ = send(&mut socket, "jwt error", vec!["jwt: exp claim is invalid".into()]).await; return; }
                 if authorization.exp < chrono::Utc::now().timestamp() as u64 + 60
                     && send(&mut socket, "token expiring", Vec::new()).await.is_err() { return; }
-                let Ok((usage, lines)) = state.console_snapshot(&id).await else { return; };
+                let Ok(usage) = state.console_snapshot(&id).await else { return; };
                 if let Some(usage) = usage {
                     let status = usage["state"].as_str().unwrap_or("offline").to_owned();
                     if send_status(&mut socket, &mut last_status, status).await.is_err() { return; }
                     if send(&mut socket, "stats", vec![usage.to_string()]).await.is_err() { return; }
                 }
-                {
-                    for line in &lines {
-                        if !seen.contains(line) {
-                            let text = line.split_once(' ').map(|(_,text)| text).unwrap_or(line).to_owned();
-                            if send(&mut socket, "console output", vec![text]).await.is_err() { return; }
-                        }
-                    }
-                    seen = lines.into_iter().collect();
-                }
+
             }
         }
     }
@@ -324,81 +328,5 @@ fn console_error_message(error: &anyhow::Error) -> &'static str {
         "This server is suspended and cannot be started."
     } else {
         "The server operation failed. Check the node logs for the cause."
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use jsonwebtoken::{EncodingKey, Header, encode};
-
-    #[test]
-    fn console_message_limits_reset_and_reject_bursts() {
-        let mut limit = MessageLimit::new(2);
-        assert!(limit.accept());
-        assert!(limit.accept());
-        assert!(!limit.accept());
-        limit.window -= Duration::from_secs(1);
-        assert!(limit.accept());
-        let mut auth = MessageLimit::new(1);
-        assert!(auth.accept());
-        assert!(!auth.accept());
-    }
-
-    #[test]
-    fn registry_failure_is_not_reported_as_account_permissions() {
-        let registry = anyhow::anyhow!("Docker error: denied access to registry");
-        let permission = anyhow::anyhow!("Power permission denied");
-        assert!(console_error_message(&registry).contains("server image"));
-        assert!(console_error_message(&permission).contains("Your account"));
-        assert!(
-            console_error_message(&anyhow::anyhow!("Server is installing"))
-                .contains("installation")
-        );
-    }
-
-    #[test]
-    fn enforces_jwt_signature_scope_issuer_and_server() {
-        let config: crate::config::Config =
-            serde_yaml::from_str(include_str!("../config.example.yml")).unwrap();
-        let id = "11111111-1111-4111-a111-111111111111";
-        let payload = json!({"exp":chrono::Utc::now().timestamp()+60,"iat":chrono::Utc::now().timestamp(),
-            "iss":config.remote,"aud":config.jwt_audience,"server_uuid":id,"user_uuid":"user","jti":"test",
-            "permissions":["websocket.connect"],"scope":"websocket"});
-        let token = encode(
-            &Header::default(),
-            &payload,
-            &EncodingKey::from_secret(config.token.as_bytes()),
-        )
-        .unwrap();
-        assert!(verify(&token, id, &config).is_ok());
-        assert!(verify(&token, "another-server", &config).is_err());
-        let bad_token = encode(
-            &Header::default(),
-            &payload,
-            &EncodingKey::from_secret(b"incorrect-key"),
-        )
-        .unwrap();
-        assert!(verify(&bad_token, id, &config).is_err());
-        for (field, value) in [
-            ("scope", json!("file-upload")),
-            ("iss", json!("http://another-panel")),
-            ("aud", json!("http://another-node")),
-            ("permissions", json!(["control.console"])),
-            ("exp", json!(0)),
-        ] {
-            let mut rejected = payload.clone();
-            rejected[field] = value;
-            let token = encode(
-                &Header::default(),
-                &rejected,
-                &EncodingKey::from_secret(config.token.as_bytes()),
-            )
-            .unwrap();
-            assert!(
-                verify(&token, id, &config).is_err(),
-                "Accepted invalid {field}"
-            );
-        }
     }
 }

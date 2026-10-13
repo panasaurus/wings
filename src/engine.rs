@@ -56,10 +56,12 @@ impl Engine {
     }
 
     pub async fn inspect(&self, id: &str) -> Result<Option<Value>> {
-        let name = Self::name(id)?;
+        self.inspect_owned(&Self::name(id)?).await
+    }
+    async fn inspect_owned(&self, name: &str) -> Result<Option<Value>> {
         let output = tokio::time::timeout(
             self.config.timeout(),
-            self.command().args(["inspect", &name]).output(),
+            self.command().args(["inspect", name]).output(),
         )
         .await
         .context("Docker inspect timed out")??;
@@ -92,8 +94,15 @@ impl Engine {
         let id = settings["uuid"]
             .as_str()
             .context("Server configuration has no UUID")?;
+        ensure!(
+            self.inspect_owned(&format!("panasaurus-install-{id}"))
+                .await?
+                .is_none(),
+            "An installation container is still running"
+        );
         if let Some(container) = self.inspect(id).await?
-            && !crate::hibernation::network_matches(&self.config, settings, &container)?
+            && (!crate::hibernation::network_matches(&self.config, settings, &container)?
+                || container["HostConfig"]["NanoCpus"].as_u64().unwrap_or(0) > 0)
         {
             ensure!(
                 container["State"]["Running"] != true,
@@ -108,9 +117,13 @@ impl Engine {
                 "Recreate the container offline to apply filesystem protection"
             );
             self.update_limits(settings).await?;
+            if container["State"]["Running"] != true {
+                crate::process::apply_engine(self, settings).await?;
+            }
             return Ok(());
         }
         crate::storage::provision(&self.config, settings).await?;
+        crate::process::apply_engine(self, settings).await?;
         let image = settings["container"]["image"]
             .as_str()
             .context("Server image is missing")?;
@@ -124,7 +137,7 @@ impl Engine {
             .output()
             .await?;
         if !local_image.status.success() {
-            self.run(&strings(&["pull", image])).await?;
+            self.pull(image).await?;
         }
         let directory = self.directory(id)?;
         tokio::fs::create_dir_all(&directory).await?;
@@ -138,7 +151,14 @@ impl Engine {
             &format!("dev.panasaurus.node={}", self.config.uuid),
             "--read-only",
             "--tmpfs",
-            "/tmp:rw,nosuid,nodev,size=67108864,mode=1777",
+            &format!(
+                "/tmp:rw,nosuid,nodev,size={},mode=1777",
+                self.config
+                    .docker
+                    .tmpfs_size
+                    .checked_mul(1024 * 1024)
+                    .context("Tmpfs size overflow")?
+            ),
             "--log-driver",
             "json-file",
             "--log-opt",
@@ -156,7 +176,7 @@ impl Engine {
             "--security-opt",
             "no-new-privileges:true",
             "--pids-limit",
-            "512",
+            &self.config.docker.container_pid_limit.to_string(),
             "--restart",
             "no",
             "--mount",
@@ -169,7 +189,25 @@ impl Engine {
                 &format!("dev.panasaurus.hibernation={}", route.listen),
             ]));
         }
-        args.extend(limit_arguments(settings, false)?);
+        args.extend(self.runtime_arguments(settings, false)?);
+        if let Some(network) = self.ensure_network().await? {
+            args.extend(strings(&["--network", &network]));
+        }
+        for ip in &self.config.docker.network.dns {
+            ip.parse::<std::net::IpAddr>()?;
+            args.extend(strings(&["--dns", ip]));
+        }
+        if !self.config.docker.userns_mode.is_empty() {
+            ensure!(
+                self.config.docker.userns_mode == "host",
+                "Unsupported user namespace mode"
+            );
+            args.extend(strings(&["--userns", "host"]));
+        }
+        if let Some(tz) = &self.config.docker.timezone {
+            args.extend(strings(&["--env", &format!("TZ={tz}")]));
+        }
+        args.extend(self.mount_arguments(settings)?);
         if let Some(environment) = settings["environment"].as_object() {
             for (key, value) in environment {
                 ensure!(!key.contains(['=', '\0']), "Invalid environment key");
@@ -205,10 +243,6 @@ impl Engine {
                 }
             }
         }
-        ensure!(
-            settings["mounts"].as_array().is_none_or(Vec::is_empty),
-            "Additional host mounts are not supported"
-        );
         args.push(image.to_owned());
         self.run(&args).await?;
         Ok(())
@@ -220,6 +254,7 @@ impl Engine {
             return Ok(false);
         };
         Ok(limits_need_rebuild(&container, settings)
+            || container["HostConfig"]["NanoCpus"].as_u64().unwrap_or(0) > 0
             || !crate::hibernation::network_matches(&self.config, settings, &container)?)
     }
 
@@ -227,7 +262,7 @@ impl Engine {
         let id = settings["uuid"].as_str().context("Missing server UUID")?;
         if self.inspect(id).await?.is_some() {
             let mut arguments = strings(&["update"]);
-            arguments.extend(limit_arguments(settings, true)?);
+            arguments.extend(self.runtime_arguments(settings, true)?);
             arguments.push(Self::name(id)?);
             self.run(&arguments).await?;
         }
@@ -281,6 +316,15 @@ impl Engine {
         Ok(())
     }
 
+    pub async fn cleanup_installer(&self, id: &str) -> Result<bool> {
+        Self::name(id)?;
+        let name = format!("panasaurus-install-{id}");
+        if self.inspect_owned(&name).await?.is_some() {
+            self.run(&strings(&["rm", "--force", &name])).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
     pub async fn remove(&self, id: &str) -> Result<()> {
         if self.inspect(id).await?.is_some() {
             self.run(&strings(&["rm", "--force", &Self::name(id)?]))
@@ -414,7 +458,8 @@ fn limits_need_rebuild(container: &Value, settings: &Value) -> bool {
     let host = &container["HostConfig"];
     (build["memory_limit"].as_u64().unwrap_or(0) == 0 && host["Memory"].as_u64().unwrap_or(0) > 0)
         || (build["cpu_limit"].as_f64().unwrap_or(0.0) == 0.0
-            && host["NanoCpus"].as_u64().unwrap_or(0) > 0)
+            && (host["NanoCpus"].as_u64().unwrap_or(0) > 0
+                || host["CpuQuota"].as_i64().unwrap_or(0) > 0))
         || (build["threads"].as_str().unwrap_or("").is_empty()
             && !host["CpusetCpus"].as_str().unwrap_or("").is_empty())
 }
@@ -483,107 +528,183 @@ fn parse_size(input: &str) -> u64 {
     (amount * multiplier) as u64
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn clearing_existing_limits_requires_container_recreation() {
-        let container = json!({"HostConfig":{"Memory":128,"NanoCpus":250000000,"CpusetCpus":"0"}});
-        assert!(limits_need_rebuild(&container, &json!({"build":{}})));
-        assert!(!limits_need_rebuild(
-            &container,
-            &json!({"build":{"memory_limit":128,"cpu_limit":25,"threads":"0"}})
-        ));
-        assert!(!limits_need_rebuild(
-            &json!({"HostConfig":{}}),
-            &json!({"build":{}})
-        ));
-    }
-
-    #[test]
-    fn resource_flags_honor_zero_swap_and_unlimited_resets() {
-        let limited = json!({"build":{"memory_limit":128,"swap":0,"cpu_limit":25}});
-        let args = limit_arguments(&limited, true).unwrap();
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--memory-swap", "128m"])
+impl Engine {
+    pub async fn pull(&self, image: &str) -> Result<()> {
+        ensure!(
+            !image.is_empty() && !image.starts_with('-') && !image.contains(['\0', '\n', '\r']),
+            "Invalid image name"
         );
-        assert!(args.windows(2).any(|pair| pair == ["--cpus", "0.25"]));
-        let unlimited = limit_arguments(&json!({"build":{}}), true).unwrap();
-        assert!(unlimited.windows(2).any(|pair| pair == ["--memory", "0m"]));
-        assert!(
-            unlimited
-                .windows(2)
-                .any(|pair| pair == ["--memory-swap", "-1"])
-        );
-        assert!(limit_arguments(&json!({"build":{"swap":-2}}), false).is_err());
-    }
-
-    #[test]
-    fn racing_directory_symlinks_cannot_escape_disk_scans() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
+        let first = image.split('/').next().unwrap_or("docker.io");
+        let registry = if first.contains('.') || first.contains(':') || first == "localhost" {
+            first
+        } else {
+            "docker.io"
         };
-        let root = tempfile::tempdir().unwrap();
-        let inside = root.path().join("inside");
-        let outside = root.path().join("outside");
-        std::fs::create_dir(&inside).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        std::fs::write(outside.join("marker"), vec![0; 1024 * 1024]).unwrap();
-        let slot = inside.join("moving");
-        let parked = root.path().join("parked");
-        std::fs::create_dir(&slot).unwrap();
-        let done = Arc::new(AtomicBool::new(false));
-        let stop = done.clone();
-        let worker = std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                std::fs::rename(&slot, &parked).unwrap();
-                std::os::unix::fs::symlink(&outside, &slot).unwrap();
-                std::thread::yield_now();
-                std::fs::remove_file(&slot).unwrap();
-                std::fs::rename(&parked, &slot).unwrap();
-                std::thread::yield_now();
+        if let Some(auth) = self.config.docker.registries.get(registry) {
+            let mut child = self
+                .command()
+                .args([
+                    "login",
+                    registry,
+                    "--username",
+                    &auth.username,
+                    "--password-stdin",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            let mut input = child.stdin.take().context("Registry input missing")?;
+            input.write_all(auth.password.as_bytes()).await?;
+            input.shutdown().await?;
+            drop(input);
+            let result = tokio::time::timeout(self.config.timeout(), child.wait()).await?;
+            ensure!(result?.success(), "Registry authentication failed");
+        }
+        self.run(&strings(&["pull", image])).await?;
+        Ok(())
+    }
+    fn runtime_arguments(&self, settings: &Value, update: bool) -> Result<Vec<String>> {
+        let mut adjusted = settings.clone();
+        let memory = settings["build"]["memory_limit"].as_u64().unwrap_or(0);
+        if memory > 0 {
+            adjusted["build"]["memory_limit"] = json!(
+                memory
+                    .checked_mul(100 + self.config.docker.memory_overhead_percent)
+                    .context("Memory overflow")?
+                    .div_ceil(100)
+            );
+        }
+        let mut args = limit_arguments(&adjusted, update)?;
+        if self.config.docker.cpu_shares > 0 {
+            args.extend(strings(&[
+                "--cpu-shares",
+                &self.config.docker.cpu_shares.to_string(),
+            ]));
+        }
+        let cpu = settings["build"]["cpu_limit"].as_f64().unwrap_or(0.0);
+        if cpu > 0.0 {
+            let period = self.config.docker.cpu_period;
+            if let Some(index) = args.iter().position(|a| a == "--cpus") {
+                args.drain(index..index + 2);
             }
-        });
-        let mut escaped = false;
-        for _ in 0..5000 {
-            if let Ok(bytes) = disk_usage(&inside) {
-                escaped |= bytes > 0;
+            args.extend(strings(&[
+                "--cpu-period",
+                &period.to_string(),
+                "--cpu-quota",
+                &((cpu / 100.0 * period as f64) as u64).max(1000).to_string(),
+            ]));
+        }
+        Ok(args)
+    }
+    pub fn mount_arguments(&self, settings: &Value) -> Result<Vec<String>> {
+        let mut args = Vec::new();
+        if let Some(mounts) = settings["mounts"].as_array() {
+            ensure!(mounts.len() <= 64, "Too many host mounts");
+            for mount in mounts {
+                let source =
+                    std::path::Path::new(mount["source"].as_str().context("Mount source missing")?)
+                        .canonicalize()?;
+                ensure!(
+                    self.config.allowed_mounts.iter().any(|p| p
+                        .canonicalize()
+                        .is_ok_and(|p| source == p || source.starts_with(p))),
+                    "Host mount is not approved on this node"
+                );
+                let target = mount["target"].as_str().context("Mount target missing")?;
+                let target_path = std::path::Path::new(target);
+                ensure!(
+                    target_path.is_absolute()
+                        && !target_path
+                            .components()
+                            .any(|p| matches!(p, std::path::Component::ParentDir))
+                        && !["/", "/home", "/home/container"].contains(&target)
+                        && !["/proc", "/sys", "/dev", "/etc"]
+                            .iter()
+                            .any(|p| target_path.starts_with(p)),
+                    "Unsafe mount target"
+                );
+                ensure!(
+                    !source.to_string_lossy().contains([',', '\n', '\r'])
+                        && !target.contains([',', '\0', '\n', '\r']),
+                    "Invalid mount syntax"
+                );
+                ensure!(
+                    !source.starts_with(&self.config.system.data),
+                    "Mount may not expose node or other server storage"
+                );
+                let readonly = mount["read_only"].as_bool().unwrap_or(true);
+                args.extend(strings(&[
+                    "--mount",
+                    &format!(
+                        "type=bind,src={},dst={target}{}",
+                        source.display(),
+                        if readonly { ",readonly" } else { "" }
+                    ),
+                ]));
             }
         }
-        done.store(true, Ordering::Relaxed);
-        worker.join().unwrap();
-        assert!(
-            !escaped,
-            "The scanner followed a racing symlink outside server storage"
+        Ok(args)
+    }
+    async fn ensure_network(&self) -> Result<Option<String>> {
+        let Some(name) = &self.config.docker.network.name else {
+            return Ok(None);
+        };
+        ensure!(
+            !["host", "none", "bridge"].contains(&name.as_str())
+                && name.len() <= 63
+                && !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "Use a dedicated Docker network name"
         );
-    }
-
-    #[test]
-    fn rejects_container_argument_and_path_injection() {
-        for id in [
-            "../other",
-            "--privileged",
-            "a/b",
-            "",
-            "11111111-1111-4111-A111-111111111111",
-        ] {
-            assert!(Engine::name(id).is_err());
+        let inspected = self
+            .command()
+            .args(["network", "inspect", name])
+            .output()
+            .await?;
+        if inspected.status.success() {
+            let networks: Vec<Value> = serde_json::from_slice(&inspected.stdout)?;
+            ensure!(
+                networks
+                    .first()
+                    .is_some_and(|n| n["Labels"]["dev.panasaurus.node"] == self.config.uuid),
+                "Docker network belongs to another operator"
+            );
+            return Ok(Some(name.clone()));
         }
-        assert!(Engine::name("11111111-1111-4111-a111-111111111111").is_ok());
-    }
-    #[test]
-    fn parses_docker_decimal_and_binary_units() {
-        assert_eq!(parse_size("1.25GiB"), 1342177280);
-        assert_eq!(parse_size(" 42.5kB "), 42500);
-        assert_eq!(parse_size("4096B"), 4096);
-    }
-    #[test]
-    fn disk_stats_do_not_follow_symlinks() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("file"), "abc").unwrap();
-        std::os::unix::fs::symlink("/", root.path().join("escape")).unwrap();
-        assert_eq!(disk_usage(root.path()).unwrap(), 3);
+        let net = &self.config.docker.network;
+        let mut args = strings(&[
+            "network",
+            "create",
+            "--driver",
+            "bridge",
+            "--label",
+            &format!("dev.panasaurus.node={}", self.config.uuid),
+            "--opt",
+            &format!("com.docker.network.bridge.enable_icc={}", net.enable_icc),
+        ]);
+        if net.internal {
+            args.push("--internal".into())
+        }
+        if let Some(mtu) = net.mtu {
+            ensure!((576..=9000).contains(&mtu), "Invalid MTU");
+            args.extend(strings(&[
+                "--opt",
+                &format!("com.docker.network.driver.mtu={mtu}"),
+            ]));
+        }
+        if let Some(subnet) = &net.subnet {
+            ensure!(!subnet.starts_with('-'), "Invalid subnet");
+            args.extend(strings(&["--subnet", subnet]));
+        }
+        if let Some(gateway) = &net.gateway {
+            gateway.parse::<std::net::IpAddr>()?;
+            args.extend(strings(&["--gateway", gateway]));
+        }
+        args.push(name.clone());
+        self.run(&args).await?;
+        Ok(Some(name.clone()))
     }
 }

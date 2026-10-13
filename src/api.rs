@@ -1,7 +1,7 @@
 use crate::{
-    Server, State,
+    Server, State, backup,
     engine::{Engine, strings},
-    files, websocket,
+    file_api, files, transfers, websocket,
 };
 use anyhow::{Context, Result, ensure};
 use axum::{
@@ -10,24 +10,24 @@ use axum::{
     http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete as delete_route, get, post, put},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
 };
 use subtle::ConstantTimeEq;
-use tower_http::cors::CorsLayer;
 
 pub struct ApiError(pub StatusCode, pub String);
 
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
+        let error = match error.downcast::<reqwest::Error>() {
+            Ok(e) => anyhow::Error::from(e.without_url()),
+            Err(e) => e,
+        };
         tracing::error!(error = %error, "Node operation failed");
         Self(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -46,25 +46,6 @@ pub type ApiResult<T> = std::result::Result<T, ApiError>;
 
 pub fn router(state: Arc<State>) -> Result<Router> {
     let config = state.engine.config.clone();
-    let mut origins: Vec<HeaderValue> = config
-        .allowed_origins
-        .iter()
-        .map(|value| value.parse())
-        .collect::<std::result::Result<_, _>>()?;
-    let remote: HeaderValue = config.remote.trim_end_matches('/').parse()?;
-    if !origins.contains(&remote) {
-        origins.push(remote);
-    }
-    let cors = CorsLayer::new()
-        .allow_origin(origins)
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::DELETE,
-            Method::PUT,
-            Method::OPTIONS,
-        ])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
     let protected = Router::new()
         .route("/api/system", get(system))
         .route("/api/update", post(update_config))
@@ -77,6 +58,40 @@ pub fn router(state: Arc<State>) -> Result<Router> {
         .route("/api/servers/{id}/files/create", post(files::create))
         .route("/api/servers/{id}/files/update", post(files::update))
         .route("/api/servers/{id}/files/delete", post(files::delete))
+        .route(
+            "/api/servers/{id}/files/create-directory",
+            post(file_api::mkdir),
+        )
+        .route("/api/servers/{id}/files/rename", put(file_api::rename))
+        .route("/api/servers/{id}/files/copy", post(file_api::copy))
+        .route("/api/servers/{id}/files/chmod", post(file_api::chmod))
+        .route("/api/servers/{id}/files/compress", post(file_api::compress))
+        .route(
+            "/api/servers/{id}/files/decompress",
+            post(file_api::decompress),
+        )
+        .route(
+            "/api/servers/{id}/files/pull",
+            post(file_api::pull).get(file_api::pulling),
+        )
+        .route(
+            "/api/servers/{id}/files/pull/{key}",
+            delete_route(file_api::cancel_pull),
+        )
+        .route("/api/servers/{id}/files/pulling", get(file_api::pulling))
+        .route("/api/servers/{id}/backup", post(backup::create))
+        .route(
+            "/api/servers/{id}/backup/{backup}",
+            delete_route(backup::delete),
+        )
+        .route(
+            "/api/servers/{id}/backup/{backup}/restore",
+            post(backup::restore),
+        )
+        .route(
+            "/api/servers/{id}/transfer",
+            post(transfers::send).delete(transfers::cancel),
+        )
         .route("/api/servers/{id}/power", post(power))
         .route("/api/servers/{id}/commands", post(commands))
         .route("/api/servers/{id}/sync", post(sync))
@@ -84,13 +99,28 @@ pub fn router(state: Arc<State>) -> Result<Router> {
         .route("/api/servers/{id}/reinstall", post(reinstall))
         .route("/api/servers/{id}/ws/deny", post(revoke))
         .route("/api/deauthorize-user", post(deauthorize))
+        .route("/api/transfers/{id}", delete_route(transfers::cancel))
         .fallback(unsupported)
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Ok(Router::new()
         .route("/api/servers/{id}/ws", get(websocket::upgrade))
+        .route("/download/file", get(file_api::download))
+        .route("/download/backup", get(backup::download))
+        .route(
+            "/upload/file",
+            post(file_api::upload).layer(DefaultBodyLimit::max(
+                (config.api.upload_limit * 1024 * 1024 + 1024 * 1024) as usize,
+            )),
+        )
+        .route(
+            "/api/transfers",
+            post(transfers::receive).layer(DefaultBodyLimit::max(
+                (config.limits.transfer_bytes + 1024 * 1024) as usize,
+            )),
+        )
         .merge(protected)
         .layer(DefaultBodyLimit::max(1024 * 1024))
-        .layer(cors)
+        .layer(middleware::from_fn_with_state(state.clone(), dynamic_cors))
         .with_state(state))
 }
 
@@ -123,49 +153,114 @@ async fn unsupported() -> ApiError {
     )
 }
 
-#[derive(Deserialize)]
-struct ConfigUpdate {
-    #[serde(default)]
-    token_id: Option<String>,
-    #[serde(default)]
-    token: Option<String>,
-    #[serde(default)]
-    remote: Option<String>,
-    #[serde(default)]
-    jwt_audience: Option<String>,
-    #[serde(default)]
-    allowed_origins: Option<Vec<String>>,
-}
-
 async fn update_config(
     AppState(state): AppState<Arc<State>>,
-    Json(body): Json<ConfigUpdate>,
-) -> ApiResult<StatusCode> {
-    let mut config = state.config.write().await;
-    if let Some(token_id) = body.token_id {
-        if !token_id.trim().is_empty() {
-            config.token_id = token_id;
+    Json(body): Json<Value>,
+) -> ApiResult<Response> {
+    let mut current = state.config.write().await;
+    let mut value = serde_json::to_value(&*current)?;
+    let object = body
+        .as_object()
+        .context("Configuration must be an object")?;
+
+    for key in [
+        "token_id",
+        "token",
+        "remote",
+        "jwt_audience",
+        "allowed_origins",
+        "api",
+        "downloads",
+        "recovery",
+        "hibernation",
+        "limits",
+    ] {
+        if let Some(v) = object.get(key) {
+            merge_config(&mut value[key], v);
         }
     }
-    if let Some(token) = body.token {
-        if token.len() >= 32 {
-            config.token = token;
+    if let Some(sftp) = object.get("system").and_then(|v| v.get("sftp")) {
+        merge_config(&mut value["system"]["sftp"], sftp);
+    }
+    if object
+        .get("uuid")
+        .is_some_and(|uuid| uuid == &json!(current.uuid))
+    {
+        value["api"]["host"] = json!(current.api.host);
+        if current.api.ssl.enabled {
+            value["api"]["ssl"]["cert"] = json!(current.api.ssl.cert);
+            value["api"]["ssl"]["key"] = json!(current.api.ssl.key);
         }
     }
-    if let Some(remote) = body.remote {
-        if reqwest::Url::parse(&remote).is_ok() {
-            config.remote = remote;
+    let candidate: crate::config::Config = serde_json::from_value(value)?;
+    candidate.validate().map_err(|_| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Node configuration is invalid.".into(),
+        )
+    })?;
+    let restart = serde_json::to_value(&candidate.api)? != serde_json::to_value(&current.api)?
+        || serde_json::to_value(&candidate.system.sftp)?
+            != serde_json::to_value(&current.system.sftp)?
+        || serde_json::to_value(&candidate.hibernation)?
+            != serde_json::to_value(&current.hibernation)?
+        || serde_json::to_value(&candidate.limits)? != serde_json::to_value(&current.limits)?;
+    candidate.save(&state.config_path)?;
+    *current = candidate;
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("x-panasaurus-restart-required", restart.to_string())
+        .body(axum::body::Body::empty())
+        .map_err(anyhow::Error::from)?)
+}
+fn merge_config(target: &mut Value, patch: &Value) {
+    if let (Some(to), Some(from)) = (target.as_object_mut(), patch.as_object()) {
+        for (k, v) in from {
+            if let Some(child) = to.get_mut(k) {
+                merge_config(child, v);
+            }
         }
+    } else {
+        *target = patch.clone();
     }
-    if let Some(jwt_audience) = body.jwt_audience {
-        if !jwt_audience.trim().is_empty() {
-            config.jwt_audience = jwt_audience;
-        }
+}
+async fn dynamic_cors(
+    AppState(state): AppState<Arc<State>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let origin = request.headers().get(header::ORIGIN).cloned();
+    let allowed = if let Some(origin) = &origin {
+        let config = state.config.read().await;
+        origin.to_str().is_ok_and(|o| {
+            o == config.remote.trim_end_matches('/')
+                || config.allowed_origins.iter().any(|v| v == o)
+        })
+    } else {
+        false
+    };
+    if origin.is_some() && !allowed {
+        return ApiError(StatusCode::FORBIDDEN, "Origin is not allowed.".into()).into_response();
     }
-    if let Some(allowed_origins) = body.allowed_origins {
-        config.allowed_origins = allowed_origins;
+    let mut response = if request.method() == Method::OPTIONS {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(request).await
+    };
+    if let Some(origin) = origin.filter(|_| allowed) {
+        let h = response.headers_mut();
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        h.insert(header::VARY, HeaderValue::from_static("Origin"));
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+        );
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            HeaderValue::from_static("Content-Type, Authorization"),
+        );
     }
-    Ok(StatusCode::NO_CONTENT)
+    response
 }
 
 fn disk_space(path: &std::path::Path) -> (u64, u64) {
@@ -224,6 +319,7 @@ async fn response(state: &State, id: &str) -> Result<Value> {
     let settings = server.settings.read().await.clone();
     let mut usage = state.engine.resources(id).await?;
     usage["hibernation"] = crate::hibernation::summary(state, id).await;
+    usage["state"] = json!(crate::lifecycle::status(state, id).await?);
     if server.installing.load(Ordering::SeqCst) {
         usage["state"] = json!("offline");
     }
@@ -285,61 +381,80 @@ async fn create(
             "Server already exists.".into(),
         ));
     }
-    servers.insert(
-        body.uuid.clone(),
-        Arc::new(Server {
-            settings: tokio::sync::RwLock::new(settings),
-            operation: Arc::new(tokio::sync::Mutex::new(())),
-            installing: AtomicBool::new(true),
-            console_slots: Arc::new(tokio::sync::Semaphore::new(16)),
-            console_users: tokio::sync::Mutex::new(HashMap::new()),
-            console_snapshot: tokio::sync::Mutex::new(crate::ConsoleSnapshot::default()),
-        }),
-    );
+    servers.insert(body.uuid.clone(), Arc::new(Server::new(settings)));
     drop(servers);
-    spawn_install(state, body.uuid, body.start_on_completion, false);
+    spawn_install(state, body.uuid, body.start_on_completion, false).await?;
     Ok(StatusCode::ACCEPTED)
 }
 
-fn spawn_install(state: Arc<State>, id: String, start: bool, reinstall: bool) {
+async fn spawn_install(
+    state: Arc<State>,
+    id: String,
+    start: bool,
+    reinstall: bool,
+) -> ApiResult<()> {
+    let server = state.server(&id).await?;
+    let operation = server.operation.clone().try_lock_owned().map_err(|_| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "A server operation is already running.".into(),
+        )
+    })?;
+    let permit = state.jobs.clone().try_acquire_owned().map_err(|_| {
+        ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Node job limit reached.".into(),
+        )
+    })?;
+    if server.lifecycle.lock().await.transferring {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Server is being transferred.".into(),
+        ));
+    }
+    server.installing.store(true, Ordering::SeqCst);
+    server.emit("install started", vec![]);
     tokio::spawn(async move {
-        let Ok(server) = state.server(&id).await else {
-            return;
-        };
-        let _operation = server.operation.lock().await;
-        if let Err(error) = crate::hibernation::manual_power(&state, &id, "stop").await {
-            tracing::error!(server = %id, error = %error, "Cannot disarm hibernation for installation");
-            server.installing.store(false, Ordering::SeqCst);
-            return;
+        let _operation = operation;
+        let _permit = permit;
+        let result = async {
+            crate::hibernation::manual_power(&state, &id, "stop").await?;
+            install(&state, &id).await
         }
-        server.installing.store(true, Ordering::SeqCst);
-        let result = install(&state, &id).await;
+        .await;
         if let Err(error) = &result {
-            tracing::error!(server = %id, error = %error, "Server installation failed");
+            tracing::error!(server=%id,error=%error,"Server installation failed");
         }
-        if let Err(error) = state
+        if state
             .installation_callback(&id, result.is_ok(), reinstall)
             .await
+            .is_err()
         {
-            tracing::error!(error = %error, "Panel installation callback failed");
+            tracing::warn!(server=%id,"Panel installation callback failed");
         }
         server.installing.store(false, Ordering::SeqCst);
-        if result.is_ok()
-            && start
-            && let Err(error) = state
-                .engine
-                .power(&server.settings.read().await.clone(), "start")
-                .await
-        {
-            tracing::error!(error = %error, "Automatic server start failed");
+        server.emit("install completed", vec![]);
+        if result.is_ok() && start {
+            let settings = server.settings.read().await.clone();
+            if let Err(error) = async {
+                crate::lifecycle::begin(&state, &server, &id).await?;
+                state.engine.power(&settings, "start").await
+            }
+            .await
+            {
+                server.lifecycle.lock().await.desired = false;
+                tracing::error!(error=%error,"Automatic server start failed");
+            }
         }
     });
+    Ok(())
 }
 
-async fn install(state: &State, id: &str) -> Result<()> {
+async fn install(state: &Arc<State>, id: &str) -> Result<()> {
     let server = state.server(id).await?;
     let settings = server.settings.read().await.clone();
-    state.engine.power(&settings, "stop").await?;
+    state.engine.cleanup_installer(id).await?;
+    crate::lifecycle::stop(state, &server, id, false).await?;
     crate::storage::provision(&state.engine.config, &settings).await?;
     let directory = state.engine.directory(id)?;
     tokio::fs::create_dir_all(&directory).await?;
@@ -358,16 +473,12 @@ async fn install(state: &State, id: &str) -> Result<()> {
             !image.starts_with('-') && !entrypoint.starts_with('-'),
             "Invalid installer image or entrypoint"
         );
-        let temporary = state
-            .engine
-            .config
-            .system
-            .data
-            .join(format!(".install-{id}"));
-        tokio::fs::create_dir_all(&temporary).await?;
-        let script_path = temporary.join("install.sh");
+        let temporary = tempfile::Builder::new()
+            .prefix("install-")
+            .tempdir_in(state.engine.config.private_root())?;
+        let script_path = temporary.path().join("install.sh");
         tokio::fs::write(&script_path, normalize_install_script(contents)).await?;
-        state.engine.run(&strings(&["pull", image])).await?;
+        state.engine.pull(image).await?;
         let name = format!("panasaurus-install-{id}");
         let mut args = strings(&[
             "run",
@@ -379,11 +490,31 @@ async fn install(state: &State, id: &str) -> Result<()> {
             "--label",
             &format!("dev.panasaurus.node={}", state.engine.config.uuid),
             "--memory",
-            "512m",
+            &format!(
+                "{}m",
+                state
+                    .engine
+                    .config
+                    .docker
+                    .installer_limits
+                    .memory
+                    .max(settings["build"]["memory_limit"].as_u64().unwrap_or(0))
+            ),
             "--cpus",
-            "1",
+            &format!(
+                "{:.2}",
+                (state.engine.config.docker.installer_limits.cpu as f64)
+                    .max(settings["build"]["cpu_limit"].as_f64().unwrap_or(0.0))
+                    / 100.0
+            ),
             "--pids-limit",
-            "512",
+            &state.engine.config.docker.container_pid_limit.to_string(),
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "CHOWN",
+            "--cap-add",
+            "FOWNER",
             "--security-opt",
             "no-new-privileges:true",
             "--workdir",
@@ -400,7 +531,10 @@ async fn install(state: &State, id: &str) -> Result<()> {
         ]);
         if let Some(env) = settings["environment"].as_object() {
             for (key, value) in env {
-                ensure!(!key.contains(['=', '\0']) && !key.starts_with('-'), "Invalid environment key");
+                ensure!(
+                    !key.contains(['=', '\0']) && !key.starts_with('-'),
+                    "Invalid environment key"
+                );
                 args.extend(strings(&[
                     "--env",
                     &format!(
@@ -417,9 +551,49 @@ async fn install(state: &State, id: &str) -> Result<()> {
             args.extend(strings(&["--env", &format!("SERVER_PORT={port}")]));
         }
         args.extend(strings(&[image, "/mnt/install.sh"]));
-        let installed = state.engine.run(&args).await;
-        let _ = tokio::fs::remove_dir_all(&temporary).await;
+        server.emit(
+            "install output",
+            vec!["Starting installation script.".into()],
+        );
+        let mut child = state
+            .engine
+            .command()
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let stdout = child.stdout.take().context("Installer output missing")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Installer error output missing")?;
+        let deadline = std::time::Duration::from_secs(
+            state.engine.config.docker.installer_limits.timeout_seconds,
+        );
+        let installed = tokio::time::timeout(deadline, async {
+            let out = crate::lifecycle::forward(
+                state.clone(),
+                id.to_owned(),
+                server.clone(),
+                stdout,
+                "install output",
+            );
+            let err = crate::lifecycle::forward(
+                state.clone(),
+                id.to_owned(),
+                server.clone(),
+                stderr,
+                "install output",
+            );
+            let (_, _, status) = tokio::join!(out, err, child.wait());
+            ensure!(status?.success(), "Installation script failed");
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("Installer timeout")
+        .and_then(|r| r);
         if installed.is_err() {
+            let _ = child.kill().await;
             let _ = state.engine.run(&strings(&["rm", "--force", &name])).await;
         }
         installed?;
@@ -439,7 +613,7 @@ async fn reinstall(
             "A server operation is already running.".into(),
         ));
     }
-    spawn_install(state, id, false, true);
+    spawn_install(state, id, false, true).await?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -450,34 +624,39 @@ struct Power {
 
 pub async fn power_action(state: &State, id: &str, action: &str) -> Result<()> {
     let server = state.server(id).await?;
-    let _operation = server.operation.lock().await;
+    let _operation = server
+        .operation
+        .clone()
+        .try_lock_owned()
+        .context("Another server operation is running")?;
     ensure!(
         !server.installing.load(Ordering::SeqCst),
         "Server is installing"
     );
     ensure!(
-        ["start", "restart", "stop", "kill"].contains(&action),
-        "Invalid power action"
+        !server.lifecycle.lock().await.transferring,
+        "Server is being transferred"
     );
     crate::hibernation::manual_power(state, id, action).await?;
-    let mut action = action;
-    if matches!(action, "start" | "restart") {
-        let settings = state
-            .remote_servers()
-            .await?
-            .remove(id)
-            .context("Server is no longer assigned to this node")?;
-        if reconcile_settings(state, &server, id, settings, true)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.1))?
-        {
-            action = "start";
+    match action {
+        "stop" => crate::lifecycle::stop(state, &server, id, false).await,
+        "kill" => crate::lifecycle::stop(state, &server, id, true).await,
+        "start" | "restart" => {
+            if action == "restart" {
+                crate::lifecycle::stop(state, &server, id, false).await?;
+            }
+            let response = state.remote(&format!("servers/{id}")).await?;
+            let mut settings = response["settings"].clone();
+            ensure!(settings["uuid"] == id, "Panel UUID mismatch");
+            settings["_process_configuration"] = response["process_configuration"].clone();
+            reconcile_settings(state, &server, id, settings.clone(), true)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.1))?;
+            crate::lifecycle::begin(state, &server, id).await?;
+            state.engine.power(&settings, "start").await
         }
+        _ => anyhow::bail!("Invalid power action"),
     }
-    state
-        .engine
-        .power(&server.settings.read().await.clone(), action)
-        .await
 }
 
 async fn power(
@@ -535,6 +714,9 @@ async fn sync(
 
 fn container_configuration(settings: &Value) -> Value {
     let mut result = settings.clone();
+    if let Some(object) = result.as_object_mut() {
+        object.remove("_process_configuration");
+    }
     if let Some(build) = result["build"].as_object_mut() {
         for key in ["memory_limit", "swap", "cpu_limit", "threads"] {
             build.remove(key);
@@ -571,9 +753,10 @@ pub(crate) async fn reconcile_settings(
                     "Restart the server to apply its updated container configuration.".into(),
                 ));
             }
-            state.engine.power(&previous, "stop").await?;
+            crate::lifecycle::stop(state, server, id, false).await?;
         }
         state.engine.remove(id).await?;
+        crate::storage::resize(&state.engine.config, &settings).await?;
     } else {
         state.engine.update_limits(&settings).await?;
     }
@@ -589,6 +772,17 @@ async fn delete(
     let _operation = server.operation.lock().await;
     crate::hibernation::manual_power(&state, &id, "stop").await?;
     state.engine.remove(&id).await?;
+    crate::storage::destroy(&state.engine.config, &id).await?;
+    for job in state
+        .downloads
+        .lock()
+        .await
+        .values()
+        .filter(|j| j.server == id)
+    {
+        job.cancel.cancel();
+    }
+    server.emit("daemon message", vec!["Server deleted.".into()]);
     crate::hibernation::remove(&state, &id).await;
     state.servers.write().await.remove(&id);
     Ok(StatusCode::NO_CONTENT)
@@ -663,29 +857,12 @@ fn normalize_install_script(script: &str) -> String {
     script.replace("\r\n", "\n")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn calculates_system_disk_space() {
-        let root = tempfile::tempdir().unwrap();
-        let (total, free) = disk_space(root.path());
-        if cfg!(unix) {
-            assert!(total > 0);
-            assert!(free > 0);
-        } else {
-            assert_eq!((total, free), (0, 0));
-        }
-    }
-
-    #[test]
-    fn normalizes_windows_installers_without_altering_other_carriage_returns() {
-        let script = "#!/bin/ash\r\nif true; then\r\n  printf 'ok\\n'\r\nfi\r\n";
-        assert_eq!(
-            normalize_install_script(script),
-            "#!/bin/ash\nif true; then\n  printf 'ok\\n'\nfi\n"
-        );
-        assert_eq!(normalize_install_script("printf '\r'\n"), "printf '\r'\n");
-    }
-}
+macro_rules! api_error_conversion {($($t:ty),*)=>{$(impl From<$t> for ApiError{fn from(e:$t)->Self{anyhow::Error::from(e).into()}})*}}
+api_error_conversion!(
+    std::io::Error,
+    reqwest::Error,
+    uuid::Error,
+    serde_json::Error,
+    std::num::ParseIntError,
+    tokio::task::JoinError
+);

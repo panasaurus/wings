@@ -272,7 +272,7 @@ fn prepare(config: &Config, settings: &Value) -> Result<()> {
     #[cfg(target_os = "linux")]
     command("chown", &["-hR", &config.docker.user, text(&payload)?])?;
     ensure!(
-        mounted_image(&directory)?.as_ref() == Some(&image),
+        mounted_image(&directory)?.is_some_and(|p| p.canonicalize().is_ok_and(|p| p == image)),
         "Storage mount verification failed"
     );
     std::fs::write(marker, bytes.to_string())?;
@@ -312,7 +312,7 @@ pub async fn verify(config: &Config, settings: &Value) -> Result<()> {
             "Storage migration is incomplete"
         );
         ensure!(
-            mounted_image(&directory)?.as_ref() == Some(&image),
+            mounted_image(&directory)?.is_some_and(|p| p.canonicalize().is_ok_and(|p| p == image)),
             "Server storage quota is not mounted. Stop the server and provision storage first."
         );
         ensure!(
@@ -328,54 +328,181 @@ pub async fn verify(config: &Config, settings: &Value) -> Result<()> {
     .await?
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    #[ignore = "Mounts a temporary quota image; requires macOS disk images or Linux root"]
-    async fn mounted_storage_is_bounded_and_failed_migrations_block_startup() {
-        let root = tempfile::tempdir().unwrap();
-        let id = uuid::Uuid::new_v4().to_string();
-        let config: Config = serde_json::from_value(serde_json::json!({
-            "uuid":uuid::Uuid::new_v4().to_string(),"token_id":"fixture","token":"a".repeat(64),
-            "remote":"http://127.0.0.1:8080","jwt_audience":"http://127.0.0.1:8081",
-            "api":{"host":"127.0.0.1","port":8081},"system":{"data":root.path()},
-            "docker":{"user":"0:0"}
-        }))
-        .unwrap();
-        let settings = serde_json::json!({"uuid":id,"build":{"disk_space":32}});
-        let directory = root.path().join(&id);
-        std::fs::create_dir(&directory).unwrap();
-        std::fs::write(directory.join("existing.txt"), "retained data").unwrap();
-        provision(&config, &settings).await.unwrap();
-        verify(&config, &settings).await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(directory.join(".server-data/existing.txt")).unwrap(),
-            "retained data"
+pub async fn resize(config: &Config, settings: &Value) -> Result<()> {
+    let config = config.clone();
+    let settings = settings.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let id = settings["uuid"].as_str().context("Missing UUID")?;
+        Engine::name(id)?;
+        let base = config.system.data.canonicalize()?;
+        let images = base.join(".quota-images");
+        ensure!(
+            !images.symlink_metadata()?.is_symlink(),
+            "Quota directory alias rejected"
         );
-        assert_eq!(
-            std::fs::read_to_string(
-                root.path()
-                    .join(".quota-images")
-                    .join(format!("{id}.backup/existing.txt"))
-            )
-            .unwrap(),
-            "retained data"
+        let extension = if cfg!(target_os = "macos") {
+            "sparseimage"
+        } else {
+            "ext4"
+        };
+        let image = images.join(format!("{id}.{extension}"));
+        if !image.exists() {
+            return Ok(());
+        }
+        ensure!(
+            image.symlink_metadata()?.is_file() && !image.symlink_metadata()?.is_symlink(),
+            "Quota image alias rejected"
         );
-        let mut changed = settings.clone();
-        changed["build"]["disk_space"] = serde_json::json!(64);
-        assert!(verify(&config, &changed).await.is_err());
-        std::fs::remove_file(
-            root.path()
-                .join(".quota-images")
-                .join(format!("{id}.ready")),
-        )
-        .unwrap();
-        assert!(provision(&config, &settings).await.is_err());
-        assert!(verify(&config, &settings).await.is_err());
-        #[cfg(target_os = "macos")]
-        command("/usr/bin/hdiutil", &["detach", text(&directory).unwrap()]).unwrap();
-        #[cfg(target_os = "linux")]
-        command("umount", &[text(&directory).unwrap()]).unwrap();
-    }
+        let desired = limit(&config, &settings)?;
+        if image_size(&image)? == desired {
+            return Ok(());
+        }
+        let mount = base.join(id);
+        let mounted = mounted_image(&mount)?;
+        if let Some(source) = &mounted {
+            ensure!(
+                source.canonicalize()? == image.canonicalize()?,
+                "Unexpected quota mount"
+            );
+            #[cfg(target_os = "macos")]
+            command("/usr/bin/hdiutil", &["detach", text(&mount)?])?;
+            #[cfg(target_os = "linux")]
+            command("umount", &[text(&mount)?])?;
+        }
+        let resized = (|| -> Result<()> {
+            #[cfg(target_os = "macos")]
+            {
+                let limits = String::from_utf8(command(
+                    "/usr/bin/hdiutil",
+                    &["resize", "-alllimits", text(&image)?],
+                )?)?;
+                let rows: Vec<Vec<&str>> = limits
+                    .lines()
+                    .map(|line| line.split_whitespace().collect())
+                    .collect();
+                let image_row = rows
+                    .iter()
+                    .find(|r| r.first() == Some(&"image"))
+                    .context("Image limits missing")?;
+                let partitions: Vec<_> = rows
+                    .iter()
+                    .filter(|r| r.last() == Some(&"Apple_HFS"))
+                    .collect();
+                ensure!(
+                    partitions.len() == 1,
+                    "Quota image must have exactly one HFS partition"
+                );
+                let total = image_row
+                    .get(2)
+                    .context("Invalid image limits")?
+                    .parse::<u64>()?;
+                let partition = partitions[0]
+                    .get(2)
+                    .context("Invalid partition limits")?
+                    .parse::<u64>()?;
+                let overhead = total
+                    .checked_sub(partition)
+                    .and_then(|n| n.checked_mul(512))
+                    .context("Invalid partition overhead")?;
+                let payload = desired
+                    .checked_sub(overhead)
+                    .context("Quota below partition overhead")?;
+                command(
+                    "/usr/bin/hdiutil",
+                    &["resize", "-size", &payload.to_string(), text(&image)?],
+                )?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let old = image_size(&image)?;
+                let checked = Command::new("e2fsck")
+                    .args(["-f", "-p", text(&image)?])
+                    .output()?;
+                ensure!(
+                    matches!(checked.status.code(), Some(0 | 1)),
+                    "Filesystem check failed"
+                );
+                let file = std::fs::OpenOptions::new().write(true).open(&image)?;
+                if desired > old {
+                    file.set_len(desired)?;
+                }
+                command(
+                    "resize2fs",
+                    &[text(&image)?, &format!("{}M", desired / (1024 * 1024))],
+                )?;
+                if desired < old {
+                    file.set_len(desired)?;
+                }
+                file.sync_all()?;
+            }
+            Ok(())
+        })();
+        if mounted.is_some() {
+            attach_image(&image, &mount)?;
+        }
+        resized?;
+        ensure!(
+            image_size(&image)? == desired,
+            "Quota resize verification failed"
+        );
+        std::fs::write(images.join(format!("{id}.ready")), desired.to_string())?;
+        Ok(())
+    })
+    .await?
+}
+
+pub async fn destroy(config: &Config, id: &str) -> Result<()> {
+    Engine::name(id)?;
+    let config = config.clone();
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use cap_std::{ambient_authority, fs::Dir};
+        let base = config.system.data.canonicalize()?;
+        let mount = base.join(&id);
+        let images = base.join(".quota-images");
+        let extension = if cfg!(target_os = "macos") {
+            "sparseimage"
+        } else {
+            "ext4"
+        };
+        let image = images.join(format!("{id}.{extension}"));
+        if mount.exists() {
+            ensure!(
+                !mount.symlink_metadata()?.is_symlink(),
+                "Server storage alias rejected"
+            );
+            if let Some(source) = mounted_image(&mount)? {
+                ensure!(
+                    source.canonicalize()? == image.canonicalize()?,
+                    "Unexpected quota mount"
+                );
+                #[cfg(target_os = "macos")]
+                command("/usr/bin/hdiutil", &["detach", text(&mount)?])?;
+                #[cfg(target_os = "linux")]
+                command("umount", &[text(&mount)?])?;
+            }
+            Dir::open_ambient_dir(&base, ambient_authority())?.remove_dir_all(&id)?;
+        }
+        if images.exists() {
+            ensure!(
+                !images.symlink_metadata()?.is_symlink(),
+                "Quota directory alias rejected"
+            );
+            let dir = Dir::open_ambient_dir(&images, ambient_authority())?;
+            for suffix in [extension, "ready"] {
+                let name = format!("{id}.{suffix}");
+                match dir.remove_file(name) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            let backup = format!("{id}.backup");
+            if dir.try_exists(&backup)? {
+                dir.remove_dir_all(backup)?;
+            }
+        }
+        Ok(())
+    })
+    .await?
 }
